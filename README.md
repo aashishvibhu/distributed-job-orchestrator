@@ -1,171 +1,166 @@
 # Distributed Workflow Engine
 
-> **Goal**: Build a generic, domain-agnostic workflow orchestration engine that accepts async jobs via REST, publishes to Kafka, processes them idempotently, and tracks state in PostgreSQL. The engine core is fully reusable; the **e-commerce order saga** serves as the concrete demo implementation. Demonstrates Kafka expertise, async architecture, Saga/Outbox patterns, retry + DLQ handling, and distributed systems design.
+> **Goal**: Build a generic, domain-agnostic workflow orchestration engine as a **multi-service distributed system**. A central **Workflow Engine** service accepts async jobs via REST, orchestrates them over Kafka by dispatching **tasks** to independent **worker services**, and tracks state in PostgreSQL. The engine core never changes when a new domain is added — new business logic ships as a new worker service. Demonstrates Kafka expertise, microservices architecture, Saga/Outbox patterns, retry + DLQ handling, and distributed systems design.
 
 ---
 
 ## 🧭 Architecture Overview
 
-```
-┌─────────┐   REST (POST /workflows)  ┌──────────────────┐   Outbox Pattern    ┌──────────────┐
-│  Client  │ ────────────────────────▶│  Workflow Engine  │ ──────────────────▶ │  PostgreSQL   │
-└─────────┘                           │  (Spring Boot)    │                     │  (workflows,  │
-                                      │  port: 8080       │                     │   outbox,     │
-                                      └────────┬─────────┘                     │   saga_state) │
-                                               │                                └──────┬───────┘
-                                      ┌────────▼─────────┐                    ┌──────▼──────────┐
-                                      │   Kafka Broker    │                    │  Outbox Poller  │
-                                      │   (KRaft mode)    │◀───────────────────│  (@Scheduled)   │
-                                      └──┬──────────┬─────┘                    └─────────────────┘
-                                         │          │
-                            ┌────────────▼──┐  ┌────▼──────────────┐
-                            │workflow.started│  │  step.completed   │
-                            │   Consumer     │  │    Consumer       │
-                            │ (idempotent)   │  │  (idempotent)     │
-                            └──────┬─────────┘  └────────┬─────────┘
-                                   │                     │
-                                   └──────────┬──────────┘
-                                              │
-                                     ┌────────▼────────┐
-                                     │ Saga Coordinator │
-                                     │ (domain-agnostic)│
-                                     │  orchestrates    │
-                                     │  SagaStep seq.   │
-                                     └────────┬────────┘
-                                              │
-                         ┌────────────────────┼────────────────────┐
-                         ▼                    ▼                    ▼
-                  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-                  │ E-Commerce   │    │ Data Pipeline│    │ Approval     │
-                  │ Saga Steps   │    │ Saga Steps   │    │ Saga Steps   │
-                  │ (impl #1) ✓  │    │ (future)     │    │ (future)     │
-                  └──────────────┘    └──────────────┘    └──────────────┘
+```mermaid
+flowchart TB
+    Client["Client"] -->|"POST /api/v1/workflows"| Engine["Workflow Engine Service\n(port 8080)\nGeneric orchestrator"]
+
+    Engine -->|"Outbox → Kafka"| Kafka["Apache Kafka\n(KRaft mode)"]
+    Engine --> EDB[("workflow_engine DB\nworkflows · definitions · outbox\nsaga_state · processed_events")]
+
+    Kafka -->|"task.request"| EW["E-commerce Worker\n(port 8081)\nconcrete impl #1"]
+    Kafka -->|"task.request"| DW["Data Pipeline Worker\n(port 8082, future)"]
+
+    EW -->|"task.completed / task.failed"| Kafka
+    DW -->|"task.completed / task.failed"| Kafka
+
+    Kafka -->|"task results"| Engine
+
+    EW --> WDB[("ecommerce_worker DB\ninventory · payments\nprocessed_events")]
+    DW --> DDB[("datapipeline_worker DB\nprocessed_events")]
 ```
 
-> **Key design point**: The `SagaCoordinator` and `SagaStep` interface are **domain-agnostic**. Any business domain implements `SagaStep` (with `execute()` + `compensate()`) and registers its pipeline. The engine doesn't know or care about orders, payments, or inventory — it just runs steps.
+> **Key design point**: The **Workflow Engine** is fully domain-agnostic. It knows only `taskType` names and workflow definitions (an ordered list of task types) — never *what* a task does. Worker services implement `TaskHandler` (from the shared `worker-sdk`) and execute tasks. Adding a new domain = deploying a new worker service + inserting one workflow-definition row. **Zero engine changes.**
+
+### Services
+
+| Service | Port | Responsibility |
+|:---|:---|:---|
+| `workflow-engine-service` | 8080 | Accepts workflows, dispatches tasks, runs the saga state machine, handles compensation |
+| `ecommerce-worker-service` | 8081 | Executes e-commerce tasks (validate, reserve-inventory, process-payment, notify) + compensations |
+| `datapipeline-worker-service` | 8082 | *(future)* Executes data-pipeline tasks — proves the engine never changes |
 
 ### End-to-End Flow (E-Commerce Demo)
 
 1. **POST /api/v1/workflows** `{ "type": "ecommerce-order", "payload": { ... } }` → `WorkflowService` writes `Workflow` + `OutboxEvent` in one DB transaction
-2. **OutboxPoller** (`@Scheduled 1s`) reads `PENDING` events, publishes to Kafka, marks `PUBLISHED`
-3. **WorkflowStartedConsumer** picks `workflow.started`, loads the registered `SagaStep` pipeline for type `ecommerce-order`, triggers `SagaCoordinator.start()`
-4. **SagaCoordinator** executes steps sequentially: `ValidateOrderStep` → `ReserveInventoryStep` → `ProcessPaymentStep` → `SendNotificationStep`
-5. Each step completion publishes `step.completed` → `StepCompletedConsumer` picks up → saga advances to next step
-6. **On failure**: `SagaCoordinator` walks backward through completed steps calling `.compensate()` on each
-7. **DLQ**: After 3 retries, `DeadLetterPublishingRecoverer` sends to `.DLT` topic
-8. **GET /api/v1/workflows/{id}/status** → full saga state with step-by-step timeline
+2. **OutboxPoller** (`@Scheduled 1s`) reads `PENDING` events, publishes `workflow.started` to Kafka, marks `PUBLISHED`
+3. **WorkflowStartedConsumer** (engine) loads the DB-backed workflow definition and starts the `SagaStateMachine`
+4. **TaskDispatcher** (engine) publishes `task.request` `{ taskType: "reserve-inventory", ... }`
+5. **E-commerce Worker** consumes it, routes to `ReserveInventoryTask` via `TaskHandlerRegistry`, executes, publishes `task.completed`
+6. **TaskResultConsumer** (engine) advances the state machine and dispatches the next task — repeating until all tasks succeed
+7. **On failure**: `CompensationPlanner` walks completed tasks in reverse and dispatches `task.request` with `action=COMPENSATE`
+8. **DLQ**: After 3 retries, `DeadLetterPublishingRecoverer` sends to `.DLT` topics (per service)
+9. **GET /api/v1/workflows/{id}/status** → full saga state with step-by-step timeline
 
 ---
 
-## 🗂️ Project Structure
+## 🗂️ Project Structure (Monorepo)
 
 ```
 distributed-workflow-engine/
-├── pom.xml
-├── docker-compose.yml
+├── pom.xml                                # Parent POM (multi-module)
+├── docker-compose.yml                     # Kafka 3.7, PostgreSQL × 2, Kafka UI
 ├── README.md
 ├── docs/
 │   └── DESIGN_DECISIONS.md
 │
-├── src/main/java/com/workflow/engine/
-│   ├── WorkflowEngineApplication.java
+├── shared/                                # ── LIBRARIES (not services) ──
+│   ├── engine-contract/                   # Wire contract — single source of truth
+│   │   └── src/main/java/com/workflow/contract/
+│   │       ├── event/
+│   │       │   ├── WorkflowStartedEvent.java
+│   │       │   ├── TaskRequestEvent.java          # taskId, taskType, action, payload, correlationId
+│   │       │   ├── TaskResultEvent.java           # taskId, status, result, error
+│   │       │   ├── WorkflowCompletedEvent.java
+│   │       │   └── WorkflowCompensatedEvent.java
+│   │       ├── enums/
+│   │       │   ├── WorkflowStatus.java            # PENDING, RUNNING, COMPLETED, FAILED, COMPENSATED
+│   │       │   ├── TaskStatus.java                # SUCCESS, FAILED
+│   │       │   ├── TaskAction.java                # EXECUTE, COMPENSATE
+│   │       │   └── OutboxStatus.java              # PENDING, PUBLISHED
+│   │       └── dto/
+│   │           └── WorkflowDefinition.java        # type → ordered List<String> taskTypes
 │   │
-│   ├── api/
-│   │   ├── controller/
-│   │   │   ├── WorkflowController.java         # POST /workflows, GET /workflows/{id}, status
-│   │   │   └── AdminController.java            # DLQ replay, simulate step failure
-│   │   └── dto/
-│   │       ├── SubmitWorkflowRequest.java       # type + payload (Map<String,Object>)
-│   │       ├── WorkflowStatusResponse.java
-│   │       └── ApiError.java
-│   │
-│   ├── domain/                                  # ── GENERIC ENGINE CORE ──
-│   │   ├── entity/
-│   │   │   ├── Workflow.java                    # JPA entity: id, type, status, payload (JSONB), correlationId
-│   │   │   ├── OutboxEvent.java                 # Outbox table entity
-│   │   │   ├── SagaState.java                   # Saga tracking: workflowId, currentStep, completedSteps[], status
-│   │   │   └── ProcessedEvent.java              # Idempotency dedup table
-│   │   ├── enums/
-│   │   │   ├── WorkflowStatus.java              # PENDING, RUNNING, COMPLETED, FAILED, COMPENSATED
-│   │   │   ├── SagaStatus.java
-│   │   │   ├── OutboxStatus.java
-│   │   │   └── StepStatus.java                  # PENDING, RUNNING, SUCCESS, FAILED, COMPENSATED
-│   │   └── repository/
-│   │       ├── WorkflowRepository.java
-│   │       ├── OutboxEventRepository.java       # @Lock(PESSIMISTIC_WRITE) for polling
-│   │       ├── SagaStateRepository.java
-│   │       └── ProcessedEventRepository.java
-│   │
-│   ├── engine/                                  # ── GENERIC ENGINE CORE ──
-│   │   ├── SagaCoordinator.java                 # Domain-agnostic: runs List<SagaStep>, handles compensation
-│   │   ├── SagaContext.java                     # Mutable context: workflowId, stepResults (Map), correlationId
-│   │   ├── SagaStep.java                        # Interface: stepName(), execute(ctx), compensate(ctx)
-│   │   ├── WorkflowRegistry.java                # Maps workflow "type" → List<SagaStep> pipeline
-│   │   └── StepResult.java                      # SUCCESS / FAILURE with optional error details
-│   │
-│   ├── saga/                                    # ── SAGA STEP IMPLEMENTATIONS ──
-│   │   └── ecommerce/                           # E-commerce domain (concrete impl #1)
-│   │       ├── EcommerceSagaConfig.java          # Registers pipeline: "ecommerce-order" → steps
-│   │       ├── steps/
-│   │       │   ├── ValidateOrderStep.java        # Validates payload, enriches context
-│   │       │   ├── ReserveInventoryStep.java     # Simulates inventory reservation
-│   │       │   ├── ProcessPaymentStep.java       # 90% success / 10% failure simulation
-│   │       │   └── SendNotificationStep.java     # Simulates email/SMS notification
-│   │       └── compensating/
-│   │           ├── ReleaseInventoryStep.java     # Compensates ReserveInventoryStep
-│   │           └── RefundPaymentStep.java        # Compensates ProcessPaymentStep
-│   │
-│   ├── messaging/
-│   │   ├── producer/
-│   │   │   ├── KafkaEventPublisher.java          # Async publish with callback logging
-│   │   │   └── OutboxPoller.java                 # @Scheduled poller
-│   │   ├── consumer/
-│   │   │   ├── WorkflowStartedConsumer.java      # Generic: loads pipeline, triggers coordinator
-│   │   │   ├── StepCompletedConsumer.java        # Generic: advances saga to next step
-│   │   │   └── DlqMonitor.java                   # Logs DLT messages
-│   │   ├── event/
-│   │   │   └── WorkflowEvent.java                # Single generic event: workflowId, type, stepName, status, payload
-│   │   └── config/
-│   │       ├── KafkaProducerConfig.java          # idempotent + transactional
-│   │       ├── KafkaConsumerConfig.java          # read_committed, manual ack, error handler
-│   │       └── KafkaTopicConfig.java             # Topic bean definitions
-│   │
-│   ├── service/
-│   │   ├── WorkflowService.java                  # Outbox Pattern — atomic writes (Workflow + OutboxEvent)
-│   │   └── IdempotencyService.java               # DB unique constraint dedup
-│   │
-│   ├── common/
-│   │   ├── exception/
-│   │   │   ├── DuplicateEventException.java
-│   │   │   ├── RetryableException.java
-│   │   │   ├── InvalidPayloadException.java       # Non-retryable → DLT immediately
-│   │   │   └── SagaStepFailedException.java
-│   │   └── util/
-│   │       ├── CorrelationIdUtil.java             # MDC-based tracing
-│   │       ├── JsonUtil.java
-│   │       └── CorrelationIdFilter.java           # Servlet filter for HTTP headers
-│   │
-│   └── monitoring/
-│       └── WorkflowMetrics.java                   # Micrometer counters/gauges
+│   └── worker-sdk/                        # Worker-side framework — reusable
+│       └── src/main/java/com/workflow/worker/
+│           ├── TaskHandler.java           # interface: taskType(), execute(ctx), compensate(ctx)
+│           ├── TaskContext.java           # taskId, workflowId, payload, correlationId
+│           ├── TaskResult.java            # SUCCESS / FAILURE with error details
+│           ├── TaskHandlerRegistry.java   # routes taskType → handler
+│           ├── WorkerKafkaConfig.java     # shared consumer/producer config + error handler
+│           ├── CorrelationIdUtil.java     # MDC + Kafka header propagation
+│           └── JsonUtil.java
 │
-├── src/main/resources/
-│   ├── application.yml
-│   ├── application-docker.yml
-│   └── db/migration/
-│       ├── V1__create_workflows_table.sql          # Generic: id, type, status, payload JSONB, correlation_id
-│       ├── V2__create_outbox_table.sql
-│       ├── V3__create_saga_state_table.sql
-│       └── V4__create_processed_events_table.sql
+├── services/
+│   ├── workflow-engine-service/           # Port 8080 — THE generic brain
+│   │   ├── pom.xml
+│   │   └── src/main/java/com/workflow/engine/
+│   │       ├── WorkflowEngineApplication.java
+│   │       ├── api/
+│   │       │   ├── WorkflowController.java        # POST /workflows, GET /workflows/{id}, status
+│   │       │   ├── AdminController.java           # DLQ replay, force-fail, retry
+│   │       │   └── dto/
+│   │       │       ├── SubmitWorkflowRequest.java # type + payload (Map<String,Object>)
+│   │       │       ├── WorkflowStatusResponse.java
+│   │       │       └── ApiError.java
+│   │       ├── domain/
+│   │       │   ├── Workflow.java                  # id, type, status, payload JSONB, correlationId
+│   │       │   ├── WorkflowDefinitionEntity.java  # type, orderedTaskTypes JSONB
+│   │       │   ├── OutboxEvent.java               # Outbox table entity
+│   │       │   ├── SagaState.java                 # workflowId, currentStep, completedSteps JSONB, status
+│   │       │   ├── ProcessedEvent.java            # Idempotency dedup
+│   │       │   └── repository/                    # 5 repositories (Outbox uses @Lock(PESSIMISTIC_WRITE))
+│   │       ├── engine/                            # ── NEVER domain-specific ──
+│   │       │   ├── SagaStateMachine.java          # generic FSM: advance / fail / complete
+│   │       │   ├── TaskDispatcher.java            # builds + publishes TaskRequestEvent
+│   │       │   ├── CompensationPlanner.java       # reverses completed tasks
+│   │       │   └── WorkflowDefinitionService.java # loads definition from DB
+│   │       ├── messaging/
+│   │       │   ├── OutboxPoller.java              # @Scheduled, PESSIMISTIC_WRITE lock
+│   │       │   ├── WorkflowStartedConsumer.java
+│   │       │   ├── TaskResultConsumer.java        # task.completed / task.failed
+│   │       │   ├── DlqMonitor.java                # Logs DLT messages
+│   │       │   └── config/
+│   │       │       ├── KafkaProducerConfig.java   # idempotent + transactional
+│   │       │       ├── KafkaConsumerConfig.java   # read_committed, manual ack, error handler
+│   │       │       └── KafkaTopicConfig.java      # Topic bean definitions
+│   │       ├── service/
+│   │       │   ├── WorkflowService.java           # Outbox Pattern — atomic writes
+│   │       │   └── IdempotencyService.java        # DB unique constraint dedup
+│   │       ├── common/
+│   │       │   ├── exception/ (DuplicateEventException, RetryableException, InvalidPayloadException, TaskFailedException)
+│   │       │   └── util/ (CorrelationIdUtil, JsonUtil, CorrelationIdFilter)
+│   │       ├── monitoring/
+│   │       │   └── WorkflowMetrics.java           # Micrometer counters/gauges
+│   │       └── resources/
+│   │           ├── application.yml
+│   │           └── db/migration/
+│   │               ├── V1__create_workflows_table.sql
+│   │               ├── V2__create_workflow_definitions_table.sql   # seed ecommerce-order
+│   │               ├── V3__create_outbox_table.sql
+│   │               ├── V4__create_saga_state_table.sql
+│   │               └── V5__create_processed_events_table.sql
+│   │
+│   └── ecommerce-worker-service/          # Port 8081 — concrete impl #1
+│       ├── pom.xml
+│       └── src/main/java/com/workflow/ecommerce/
+│           ├── EcommerceWorkerApplication.java
+│           ├── task/                                  # each implements TaskHandler
+│           │   ├── ValidateOrderTask.java
+│           │   ├── ReserveInventoryTask.java          # Simulates inventory reservation
+│           │   ├── ProcessPaymentTask.java            # 90% success / 10% failure
+│           │   ├── SendNotificationTask.java          # Simulates email/SMS notification
+│           │   └── compensating/
+│           │       ├── ReleaseInventoryTask.java      # Compensates ReserveInventoryTask
+│           │       └── RefundPaymentTask.java         # Compensates ProcessPaymentTask
+│           ├── messaging/
+│           │   ├── TaskRequestConsumer.java           # routes via TaskHandlerRegistry
+│           │   └── config/
+│           ├── domain/                                # OWN database
+│           │   ├── Inventory.java
+│           │   ├── Payment.java
+│           │   ├── ProcessedEvent.java
+│           │   └── repository/
+│           └── resources/
+│               ├── application.yml
+│               └── db/migration/ (inventory, payments, processed_events)
 │
-└── src/test/java/com/workflow/engine/
-    ├── integration/
-    │   └── WorkflowSagaIntegrationTest.java        # Testcontainers: Kafka + PostgreSQL
-    ├── unit/
-    │   ├── SagaCoordinatorTest.java                # Mockito: happy path + compensation (generic)
-    │   ├── EcommerceSagaTest.java                  # E-commerce specific step tests
-    │   └── IdempotencyServiceTest.java
-    └── contract/
-        └── WorkflowControllerTest.java
+└── services/datapipeline-worker-service/   # future — proves "zero engine changes"
 ```
 
 ---
@@ -174,44 +169,43 @@ distributed-workflow-engine/
 
 | Pattern | Implementation | Key Design Decision |
 |:---|:---|:---|
-| **Outbox Pattern** | `WorkflowService` writes Workflow + OutboxEvent + SagaState in single `@Transactional`; `OutboxPoller` publishes to Kafka | Chose polling (`@Scheduled`) over CDC (Debezium) — simpler setup, pattern identical |
-| **Saga (Orchestration)** | `SagaCoordinator` executes `List<SagaStep>` sequentially, persists state after each step, walks backward calling `compensate()` on failure | Chose orchestration over choreography — centralized rollback logic, easier to test. Coordinator is domain-agnostic. |
-| **Pluggable Steps** | `SagaStep` interface: `execute(SagaContext)` / `compensate(SagaContext)`. `WorkflowRegistry` maps workflow type → step pipeline. | New domains = new `SagaStep` impls + one config class. Engine code never changes. |
-| **Idempotent Consumer** | `IdempotencyService` uses `processed_events` table with UNIQUE constraint on `message_id` | Combined with Kafka `read_committed` + idempotent producer = effectively exactly-once |
-| **DLQ with Retry** | `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` — 3 retries with 2s fixed backoff, then DLT | `InvalidPayloadException` skips retry → DLT immediately (non-retryable) |
-| **Correlation ID Tracing** | `CorrelationIdFilter` extracts/generates `X-Correlation-Id` → MDC → all log lines + Kafka headers | End-to-end traceability across REST → Kafka → DB, domain-agnostic |
+| **Outbox Pattern** | `WorkflowService` writes Workflow + OutboxEvent in single `@Transactional`; `OutboxPoller` publishes to Kafka | Chose polling (`@Scheduled`) over CDC (Debezium) — simpler setup, identical pattern |
+| **Saga (Task-based Orchestration)** | Engine's `SagaStateMachine` dispatches `task.request` events; workers execute tasks and reply `task.completed`/`task.failed`; `CompensationPlanner` walks backward on failure | Orchestration (central state machine) + choreography (event-driven task dispatch) — mirrors Temporal/Conductor |
+| **Pluggable Workers** | `TaskHandler` interface in `worker-sdk`; `TaskHandlerRegistry` routes `taskType` → handler | New domains = new worker services + one definition row. Engine code never changes. |
+| **Idempotent Consumers** | Each service owns a `processed_events` table with UNIQUE `message_id` constraint | Dedup enforced on **both sides of every hop** (engine + workers) — at-least-once → effectively-once |
+| **DLQ with Retry** | Per-service `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` — 3 retries × 2s, then DLT | `InvalidPayloadException` skips retry → DLT immediately (non-retryable) |
+| **Correlation ID Tracing** | `CorrelationIdFilter` → MDC → Kafka headers → propagated across engine + worker JVMs | End-to-end traceability across HTTP → Kafka → worker → Kafka → engine |
+| **Database-per-service** | Each service owns its schema; no cross-service DB access | Real data isolation — workers and engine fail independently |
 
 ---
 
-## 🔌 Extensibility: Engine vs. Domain Separation
+## 🔌 Extensibility: Engine vs. Worker Separation
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                 ENGINE (never changes)              │
-│                                                     │
-│  Workflow.java          SagaCoordinator.java        │
-│  SagaStep.java          SagaContext.java            │
-│  WorkflowRegistry.java  WorkflowService.java        │
-│  OutboxPoller.java      IdempotencyService.java     │
-│  WorkflowStartedConsumer / StepCompletedConsumer    │
-│  DLQ / Retry / Correlation / Metrics                │
-│                                                     │
-├─────────────────────────────────────────────────────┤
-│             DOMAIN IMPLEMENTATIONS                   │
-│                                                     │
-│  ┌─ ecommerce/ ─────────────────────────────────┐   │
-│  │ EcommerceSagaConfig.java                     │   │
-│  │ ValidateOrderStep      ReleaseInventoryStep  │   │
-│  │ ReserveInventoryStep   RefundPaymentStep     │   │
-│  │ ProcessPaymentStep                           │   │
-│  │ SendNotificationStep                         │   │
-│  └──────────────────────────────────────────────┘   │
-│                                                     │
-│  ┌─ datapipeline/ (future) ─────────────────────┐   │
-│  │ DataPipelineSagaConfig.java                  │   │
-│  │ ExtractStep  TransformStep  LoadStep         │   │
-│  └──────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                 WORKFLOW ENGINE SERVICE (never changes)        │
+│                                                               │
+│  Workflow.java             SagaStateMachine.java              │
+│  WorkflowDefinitionService TaskDispatcher.java                │
+│  OutboxPoller.java         CompensationPlanner.java           │
+│  WorkflowStartedConsumer   TaskResultConsumer                 │
+│  DLQ / Retry / Correlation / Metrics                          │
+│                                                               │
+│        Kafka: task.request ⇄ task.completed / task.failed     │
+├───────────────────────────────────────────────────────────────┤
+│                 WORKER SERVICES (pluggable)                   │
+│                                                               │
+│  ┌─ ecommerce-worker-service (port 8081) ───────────────┐     │
+│  │ ValidateOrderTask       ReleaseInventoryTask         │     │
+│  │ ReserveInventoryTask    RefundPaymentTask            │     │
+│  │ ProcessPaymentTask                                   │     │
+│  │ SendNotificationTask                                 │     │
+│  └───────────────────────────────────────────────────────┘     │
+│                                                               │
+│  ┌─ datapipeline-worker-service (port 8082, future) ─────┐    │
+│  │ ExtractTask  TransformTask  LoadTask                  │    │
+│  └───────────────────────────────────────────────────────┘    │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### How to Add a New Domain
@@ -219,23 +213,17 @@ distributed-workflow-engine/
 Adding a new workflow type (e.g., "data-pipeline") requires **zero engine changes**:
 
 ```java
-// 1. Implement SagaStep for each stage
+// 1. New worker service implements TaskHandler for each task (from worker-sdk)
 @Component
-public class ExtractStep implements SagaStep {
-    public String getStepName() { return "data-extract"; }
-    public StepResult execute(SagaContext ctx) { /* ... */ }
-    public StepResult compensate(SagaContext ctx) { /* ... */ }
+public class ExtractTask implements TaskHandler {
+    public String getTaskType() { return "data-extract"; }
+    public TaskResult execute(TaskContext ctx) { /* ... */ }
+    public TaskResult compensate(TaskContext ctx) { /* ... */ }
 }
 
-// 2. Register the pipeline
-@Configuration
-public class DataPipelineSagaConfig {
-    @Bean
-    public WorkflowRegistryEntry dataPipelineEntry(
-            ExtractStep extract, TransformStep transform, LoadStep load) {
-        return new WorkflowRegistryEntry("data-pipeline", List.of(extract, transform, load));
-    }
-}
+// 2. Insert one workflow-definition row in the engine's DB
+// INSERT INTO workflow_definitions (type, ordered_task_types)
+// VALUES ('data-pipeline', '["data-extract","data-transform","data-load"]');
 
 // 3. Submit via API
 // POST /api/v1/workflows  { "type": "data-pipeline", "payload": { "source": "s3://..." } }
@@ -245,80 +233,74 @@ public class DataPipelineSagaConfig {
 
 ## 📋 Implementation Phases
 
-### Phase 1: Scaffold & Infrastructure (Day 1 — ~4 hours)
+### Phase 1: Monorepo Scaffold & Infrastructure (Day 1 — ~5 hours)
 
-- Initialize Spring Boot 3.3+ project (Maven, Java 17)
+- Initialize parent Maven POM (multi-module) with Java 17
+- Create shared modules: `engine-contract` (event schemas + enums) and `worker-sdk` (TaskHandler, registry, Kafka plumbing)
 - Dependencies: Spring Web, Spring Data JPA, Spring Kafka, Flyway, PostgreSQL Driver, Lombok, Actuator, Testcontainers, Validation, Awaitility, AssertJ
-- Write `docker-compose.yml`: PostgreSQL 16, Kafka 3.7 (KRaft mode), Kafka UI
-- Configure `application.yml`: Kafka producer (idempotent, `acks=all`), consumer (`read_committed`, manual ack), Flyway
-- Create `KafkaTopicConfig` bean: 7 topics, 3 partitions each (workflow.started, step.completed, step.failed, workflow.completed, workflow.compensated, + 2 DLTs)
-- Smoke test: health endpoint green, Kafka UI visible
+- Write `docker-compose.yml`: Kafka 3.7 (KRaft mode), PostgreSQL 16 × 2 (engine + e-commerce worker), Kafka UI
+- Configure per-service `application.yml`: Kafka producer (idempotent, `acks=all`), consumer (`read_committed`, manual ack), Flyway
+- Create `KafkaTopicConfig` bean: 6 topics + DLTs (`workflow.started`, `task.request`, `task.completed`, `task.failed`, `workflow.completed`, `workflow.compensated`)
+- Smoke test: both services' health endpoints green, Kafka UI visible
 
-### Phase 2: Core Domain & Outbox Pattern (Day 2 — ~5 hours)
+### Phase 2: Engine Service — Outbox & Domain (Day 2 — ~8 hours)
 
-- Write 4 Flyway migrations (`workflows` with JSONB payload, `outbox_events`, `saga_states`, `processed_events`)
-- Create 4 JPA entities: `Workflow` (generic), `OutboxEvent`, `SagaState`, `ProcessedEvent`
-- Create 4 enums: `WorkflowStatus`, `SagaStatus`, `OutboxStatus`, `StepStatus`
-- Create 4 Spring Data repositories (`OutboxEventRepository` uses `@Lock(PESSIMISTIC_WRITE)`)
-- Implement generic engine interfaces: `SagaStep`, `SagaContext`, `StepResult`, `WorkflowRegistry`
-- Implement `SagaCoordinator` (domain-agnostic — knows nothing about e-commerce)
-- Implement utility classes: `CorrelationIdUtil` (MDC), `JsonUtil` (Jackson)
-- Implement `KafkaProducerConfig` + `KafkaEventPublisher` (async with callback)
-- Implement `WorkflowService.submitWorkflow()` — Outbox Pattern: Workflow + OutboxEvent + SagaState in one transaction
+- Write 5 Flyway migrations for the engine DB (`workflows`, `workflow_definitions`, `outbox_events`, `saga_states`, `processed_events`)
+- Create 5 JPA entities: `Workflow`, `WorkflowDefinitionEntity`, `OutboxEvent`, `SagaState`, `ProcessedEvent`
+- Create 5 repositories (`OutboxEventRepository` uses `@Lock(PESSIMISTIC_WRITE)`)
+- Implement `WorkflowService.submitWorkflow()` — Outbox Pattern: Workflow + OutboxEvent in one transaction
 - Implement `OutboxPoller` — `@Scheduled` every 1s, reads PENDING events, publishes, marks PUBLISHED
-- Create DTOs: `SubmitWorkflowRequest` (with `@Valid`, `type` + flexible `payload`), `WorkflowStatusResponse`, `ApiError`
+- Create DTOs: `SubmitWorkflowRequest`, `WorkflowStatusResponse`, `ApiError`
 - Implement `WorkflowController`: POST /workflows, GET /workflows/{id}, GET /workflows/{id}/status
-- Verify: POST workflow → DB writes + Kafka message visible in Kafka UI
+- Verify: POST workflow → engine DB writes + `workflow.started` visible in Kafka UI
 
-### Phase 3: Kafka Consumers + Idempotency (Day 3 — ~5 hours)
+### Phase 3: Engine Service — State Machine & Task Dispatch (Day 3 — ~8 hours)
 
-- Create generic `WorkflowEvent` POJO (single event class with type discriminator)
-- Implement `IdempotencyService`: `isDuplicate()` + `markProcessed()` using DB UNIQUE constraint
-- Create 4 exception classes: `DuplicateEventException`, `RetryableException`, `InvalidPayloadException`, `SagaStepFailedException`
-- Implement `KafkaConsumerConfig`: `DefaultErrorHandler` with `DeadLetterPublishingRecoverer` (3 retries × 2s), `InvalidPayloadException` → no retry
-- Implement `WorkflowStartedConsumer` — generic: loads pipeline from `WorkflowRegistry`, triggers `SagaCoordinator.start()`
-- Implement `StepCompletedConsumer` — generic: tells `SagaCoordinator` to advance to next step
-- Verify: consumer picks up message, `processed_events` table populated, duplicates skipped
+- Implement `SagaStateMachine` — generic FSM: advance / fail / complete / compensate
+- Implement `TaskDispatcher` — builds + publishes `TaskRequestEvent` to `task.request`
+- Implement `WorkflowDefinitionService` — loads `WorkflowDefinition` (ordered task types) from DB
+- Implement `WorkflowStartedConsumer` — loads definition, starts state machine, dispatches first task
+- Implement `TaskResultConsumer` — consumes `task.completed` / `task.failed`, advances or compensates
+- Implement `CompensationPlanner` — walks completed tasks in reverse, dispatches `action=COMPENSATE`
+- Implement `IdempotencyService` + `processed_events` dedup
+- Create 4 exception classes: `DuplicateEventException`, `RetryableException`, `InvalidPayloadException`, `TaskFailedException`
+- Verify: engine dispatches task requests and reacts to mocked results
 
-### Phase 4: E-Commerce Saga Implementation (Day 4–5 — ~8 hours)
+### Phase 4: E-Commerce Worker Service (Day 4–5 — ~8 hours)
 
-- Implement 4 e-commerce forward steps (all implement `SagaStep`):
-  - `ValidateOrderStep` — validates payload, enriches `SagaContext`
-  - `ReserveInventoryStep` — simulates inventory reservation
-  - `ProcessPaymentStep` — 90% success / 10% failure simulation (configurable via admin toggle)
-  - `SendNotificationStep` — simulates notification dispatch
-- Implement 2 compensating steps:
-  - `ReleaseInventoryStep` — compensates `ReserveInventoryStep`
-  - `RefundPaymentStep` — compensates `ProcessPaymentStep`
-- Implement `EcommerceSagaConfig` — registers `"ecommerce-order"` type with step list
-- Verify `SagaCoordinator` runs the e-commerce pipeline end-to-end:
-  - Happy path → all 4 steps succeed → `WorkflowStatus.COMPLETED`
-  - Payment failure → compensation runs: RefundPayment → ReleaseInventory → `WorkflowStatus.COMPENSATED`
-- Wire `WorkflowMetrics` counters (`workflow.saga.completed`, `workflow.saga.compensated`)
-- Verify: crash-resilience — saga state persisted after each step transition
+- Scaffold `ecommerce-worker-service` depending on `worker-sdk` + `engine-contract`
+- Write Flyway migrations for the worker DB (`inventory`, `payments`, `processed_events`)
+- Implement 4 forward `TaskHandler`s: `ValidateOrderTask`, `ReserveInventoryTask`, `ProcessPaymentTask` (90/10 simulation), `SendNotificationTask`
+- Implement 2 compensating `TaskHandler`s: `ReleaseInventoryTask`, `RefundPaymentTask`
+- Implement `TaskRequestConsumer` — routes `taskType` → handler via `TaskHandlerRegistry`, publishes `task.completed` / `task.failed`
+- Seed `workflow_definitions` with `ecommerce-order` → `[validate-order, reserve-inventory, process-payment, send-notification]`
+- Verify end-to-end:
+  - Happy path → all tasks succeed → `WorkflowStatus.COMPLETED`
+  - Payment failure → compensation: refund-payment → release-inventory → `WorkflowStatus.COMPENSATED`
+- Verify crash-resilience — saga state persisted after each task transition
 
-### Phase 5: DLQ & Observability (Day 6 — ~5 hours)
+### Phase 5: DLQ & Observability (Day 6 — ~6 hours)
 
-- Implement `DlqMonitor` — listens to `.DLT` topics, logs structured JSON for alerting
-- Implement `AdminController`:
-  - `POST /admin/simulate/step-failure?step=process-payment&enabled=true` — generic toggle for any step
+- Implement `DlqMonitor` in both services — listens to `.DLT` topics, logs structured JSON
+- Implement `AdminController` (engine):
+  - `POST /admin/simulate/task-failure?task=process-payment&enabled=true` — generic toggle (enforced in worker)
   - `POST /admin/dlt/replay?topic=&key=` — DLQ message replay
   - `GET /admin/workflows?type=&status=` — workflow search
 - Implement `CorrelationIdFilter` — extracts/generates `X-Correlation-Id` on every HTTP request
-- Implement `WorkflowMetrics` — Micrometer counters (`workflow.saga.completed`, `workflow.saga.compensated`) + gauge (`workflow.outbox.pending`)
+- Implement `WorkflowMetrics` — counters (`workflow.saga.completed`, `workflow.saga.compensated`) + gauge (`workflow.outbox.pending`)
+- Propagate correlation ID through Kafka headers across engine + worker JVMs
 - Configure Logback MDC pattern to include `correlationId` + `workflowType` in every log line
-- Update `OutboxPoller` to report pending count to metrics
-- Verify: correlation ID in logs + Kafka headers, metrics endpoint, DLQ logging
+- Verify: one correlation ID traces the full journey across both services
 
-### Phase 6: Testing & Documentation (Day 7 — ~8 hours)
+### Phase 6: Testing & Documentation (Day 7 — ~10 hours)
 
-- **Integration test**: Testcontainers (PostgreSQL + Kafka), verify POST → DB → Outbox → Kafka → Saga completion, Awaitility for async assertions
+- **Integration test**: Testcontainers (Kafka + 2 PostgreSQL), verify POST → engine DB → Outbox → Kafka → worker → Kafka → engine → COMPLETED, Awaitility for async assertions
 - **Unit tests**:
-  - `SagaCoordinatorTest` — Mockito: generic happy path + compensation (domain-agnostic)
-  - `EcommerceSagaTest` — e-commerce step tests
+  - `SagaStateMachineTest` — Mockito: generic happy path + compensation (domain-agnostic)
+  - `EcommerceWorkerTest` — e-commerce task handler tests
   - `IdempotencyServiceTest` — dedup logic
 - **README.md**: architecture diagram (Mermaid), quick-start, API table, pattern explanations, how to add new domains
-- **DESIGN_DECISIONS.md**: Kafka vs RabbitMQ, Outbox polling vs Debezium, orchestration vs choreography, generic engine design rationale
+- **DESIGN_DECISIONS.md**: Kafka vs RabbitMQ, Outbox polling vs Debezium, orchestration vs choreography, task-dispatch engine design, monorepo vs polyrepo
 - **demo.sh**: full bash script — happy path, toggle failure, compensation, DLQ replay, metrics
 
 ---
@@ -327,9 +309,10 @@ public class DataPipelineSagaConfig {
 
 ```
 Java 17
-Spring Boot 3.3+
+Maven (multi-module parent POM)
+Spring Boot 3.3+ (2+ independently deployable services)
 Spring Kafka 3.1+
-PostgreSQL 16 (Docker)
+PostgreSQL 16 (one database per service, Docker)
 Apache Kafka 3.7 (KRaft mode)
 Flyway 10.x
 Testcontainers 1.19+
@@ -340,41 +323,44 @@ JUnit 5 + Mockito + AssertJ + Awaitility
 
 ---
 
-## 📊 API Endpoints
+## 📊 API Endpoints (Workflow Engine — port 8080)
 
 | Method | Path | Description |
 |:---|:---|:---|
 | `POST` | `/api/v1/workflows` | Submit a workflow. Body: `{ "type": "ecommerce-order", "payload": {...} }` |
 | `GET` | `/api/v1/workflows/{id}` | Get workflow + saga summary |
-| `GET` | `/api/v1/workflows/{id}/status` | Get full saga state (completed steps, current step, status) |
+| `GET` | `/api/v1/workflows/{id}/status` | Get full saga state (completed tasks, current task, status) |
 | `GET` | `/api/v1/workflows?type=ecommerce-order` | List workflows by type |
-| `POST` | `/api/v1/admin/simulate/step-failure?step=process-payment&enabled=true` | Toggle 100% failure on any step by name (generic) |
+| `POST` | `/api/v1/admin/simulate/task-failure?task=process-payment&enabled=true` | Toggle 100% failure on any task by name (generic) |
 | `POST` | `/api/v1/admin/dlt/replay?topic=&key=` | Replay a DLQ message |
 
 ---
 
 ## 📊 Kafka Topics (Generic)
 
-| Topic | Partitions | Purpose |
-|:---|:---|:---|
-| `workflow.started` | 3 | New workflow submitted, triggers `SagaCoordinator.start()` |
-| `step.completed` | 3 | A saga step finished successfully, triggers next step |
-| `step.failed` | 3 | A saga step failed, triggers compensation |
-| `workflow.completed` | 3 | Entire saga completed successfully |
-| `workflow.compensated` | 3 | Entire saga rolled back |
-| `workflow.started.DLT` | 3 | Dead letter for workflow.started |
-| `step.completed.DLT` | 3 | Dead letter for step.completed |
+| Topic | Producer | Consumer | Partitions | Purpose |
+|:---|:---|:---|:---|:---|
+| `workflow.started` | Engine (outbox) | Engine | 3 | New workflow submitted, starts the saga state machine |
+| `task.request` | Engine | All workers | 3 | Dispatch a task — `taskType` discriminator routes to handler |
+| `task.completed` | Worker | Engine | 3 | Task succeeded → advance state machine |
+| `task.failed` | Worker | Engine | 3 | Task failed → trigger compensation |
+| `workflow.completed` | Engine | Monitoring | 3 | Entire saga completed successfully |
+| `workflow.compensated` | Engine | Monitoring | 3 | Entire saga rolled back |
+| `*.DLT` | DeadLetterRecoverer | DlqMonitor | 3 | Dead letters per topic |
+
+> **Routing note**: `task.request` is partitioned by `workflowId` for ordering; workers filter by `taskType`. One generic topic — the engine never knows a domain.
 
 ---
 
 ## 📊 Metrics (Actuator)
 
-| Metric | Type | Description |
-|:---|:---|:---|
-| `workflow.saga.completed` | Counter | Successfully completed sagas (all types) |
-| `workflow.saga.compensated` | Counter | Rolled-back sagas (all types) |
-| `workflow.saga.completed{type=ecommerce-order}` | Counter | Per-type counters via tags |
-| `workflow.outbox.pending` | Gauge | Current outbox backlog |
+| Metric | Service | Type | Description |
+|:---|:---|:---|:---|
+| `workflow.saga.completed` | Engine | Counter | Successfully completed sagas (all types) |
+| `workflow.saga.compensated` | Engine | Counter | Rolled-back sagas (all types) |
+| `workflow.saga.completed{type=ecommerce-order}` | Engine | Counter | Per-type counters via tags |
+| `workflow.outbox.pending` | Engine | Gauge | Current outbox backlog |
+| `worker.task.completed{task=process-payment}` | Workers | Counter | Per-task execution counts |
 
 ---
 
@@ -382,34 +368,26 @@ JUnit 5 + Mockito + AssertJ + Awaitility
 
 | Phase | Task | Effort |
 |:---|:---|---:|
-| 1 | Scaffold + Docker + Config + Health | 4 hours |
-| 2 | Generic entities + Flyway + Outbox + WorkflowService + OutboxPoller + SagaCoordinator | 5 hours |
-| 3 | Generic consumers + Idempotency + ErrorHandler + DLQ routing | 5 hours |
-| 4 | E-commerce SagaStep implementations + config + integration with coordinator | 8 hours |
-| 5 | DLQ monitor + Correlation filter + Micrometer metrics + Admin endpoints | 5 hours |
-| 6 | Testcontainers integration test + unit tests + README + Mermaid diagrams | 8 hours |
-| **Total** | | **~35 hours** |
+| 1 | Monorepo scaffold + shared modules + Docker (Kafka, 2 PG, UI) | 5 hours |
+| 2 | Engine service: entities + migrations + Outbox + WorkflowService + OutboxPoller | 8 hours |
+| 3 | Engine service: state machine + task dispatch + result consumer + compensation | 8 hours |
+| 4 | E-commerce worker service: tasks + idempotency + DLQ | 8 hours |
+| 5 | DLQ monitor + correlation + metrics + admin endpoints (cross-service) | 6 hours |
+| 6 | Testcontainers integration test + unit tests + README + Mermaid diagrams | 10 hours |
+| **Total** | | **~45 hours** |
 
 ---
 
-## 🎯 Files Created: ~43 files
+## 🎯 Files Created: ~60 files
 
 | Layer | Count |
 |:---|---:|
-| Config (YAML, Docker) | 3 |
-| Flyway migrations | 4 |
-| Generic entities + enums | 8 |
-| Repositories | 4 |
-| Engine core (Coordinator, Context, Step, Registry, StepResult) | 5 |
-| E-commerce saga steps (forward + compensating + config) | 7 |
-| DTOs | 3 |
-| Controllers | 2 |
-| Services | 2 |
-| Kafka configs | 3 |
-| Kafka consumers (generic) | 3 |
-| Event POJO (single generic) | 1 |
+| Config (POMs, YAML, Docker) | 6 |
+| Shared contract (events + enums + dto) | 11 |
+| Worker SDK (TaskHandler, Registry, Context, Result, utils) | 7 |
+| Engine service (entities, repositories, engine, messaging, api, service, common, monitoring) | 24 |
+| Worker service (tasks, messaging, domain) | 12 |
+| Flyway migrations (engine 5 + worker 3) | 8 |
 | Exceptions | 4 |
-| Utilities | 3 |
-| Monitoring | 1 |
-| Tests | 4 |
+| Tests | 6 |
 | Docs | 2 |
