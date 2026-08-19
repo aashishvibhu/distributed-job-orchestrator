@@ -309,15 +309,16 @@ public class MyTaskHandler implements TaskHandler {
 ```
 Java 21 (LTS)
 Maven (multi-module parent POM, maven-compiler-plugin 3.13+)
-Spring Boot 3.5.x (2+ independently deployable services)
-Spring Kafka 3.3.x (Spring Framework 6.2.x)
+Spring Boot 4.1.x (2+ independently deployable services)
+Spring Kafka 4.x (Spring Framework 7.x)
 PostgreSQL 16 (one database per service, Docker)
 Apache Kafka 3.9 (KRaft mode; client managed by Boot)
 Flyway 11.x
-Testcontainers 1.21.x
-Micrometer 1.15.x (Actuator)
+Jackson 3.x (tools.jackson — Boot 4 default)
+Testcontainers 1.22.x
+Micrometer 2.x (Actuator)
 Lombok 1.18.x (managed)
-JUnit 5.12 + Mockito 5.17 + AssertJ 3.27 + Awaitility 4.3
+JUnit 5.13 + Mockito 5.20 + AssertJ 3.27 + Awaitility 4.3 (test)
 ```
 
 ---
